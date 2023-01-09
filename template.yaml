@@ -4,7 +4,7 @@ Description: 'This template deploys a VPC, with a pair of public and private sub
   across two Availability Zones. It deploys an internet gateway, with a default
   route on the public subnets. It deploys a pair of NAT gateways (one in each AZ),
   and default routes for them in the private subnets.
-  It deploys EKS control plane and worker node resources'
+  It deploys EKS control plane and worker node resources.'
 
 Mappings:
   ServicePrincipalPartitionMap:
@@ -22,9 +22,58 @@ Mappings:
       EKSFargatePods: eks-fargate-pods.amazonaws.com
 
 Parameters:
-  EnvironmentName: thoughtMachine
+  EnvironmentName: 
     Description: An environment name that is prefixed to resource names
     Type: String
+    Default: thoughtMachine-dev
+
+  ClusterName: 
+    Description: Please enter a name for the Kubernetes cluster
+    Type: String
+    Default: thoughtMachine-cluster-dev
+
+  DBName:
+    Default: thoughtMachineDatabaseDev
+    Description: Please enter a name for the database
+    Type: String
+    MinLength: '1'
+    MaxLength: '64'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric
+      characters.
+
+  DBUser:
+    Description: Please enter a database admin account username
+    Type: String
+    Default: MyUsername
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric
+      characters.
+
+  DBPassword:
+    NoEcho: 'true'
+    Description: Please enter a database admin account password
+    Type: String
+    Default: MyPassword
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]+'
+    ConstraintDescription: must contain only alphanumeric characters.
+
+  DBAllocatedStorage:
+    Default: '20'
+    Description: The size of the database (Gb)
+    Type: Number
+    MinValue: '20'
+    MaxValue: '6144'
+    ConstraintDescription: must be between 20 and 6144 Gb.
+
+  DBInstanceClass:
+    Description: The database instance type
+    Type: String
+    Default: db.t3.micro
 
   VpcCIDR:
     Description: Please enter the IP range (CIDR notation) for this VPC
@@ -50,6 +99,7 @@ Parameters:
     Description: Please enter the IP range (CIDR notation) for the private subnet in the second Availability Zone
     Type: String
     Default: 192.168.0.192/26
+
 
 Resources:
   VPC:
@@ -226,7 +276,7 @@ Resources:
     Properties:
       KubernetesNetworkConfig:
         IpFamily: ipv4
-      Name: thoughtMachine-cluster
+      Name: !Ref ClusterName
       ResourcesVpcConfig:
         EndpointPrivateAccess: false
         EndpointPublicAccess: true
@@ -247,8 +297,10 @@ Resources:
 
   LaunchTemplate:
     Type: 'AWS::EC2::LaunchTemplate'
+    DependsOn: ControlPlane
     Properties:
       LaunchTemplateData:
+        KeyName: thoughtMachineSSH
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:
@@ -260,12 +312,12 @@ Resources:
           HttpPutResponseHopLimit: 2
           HttpTokens: optional
         SecurityGroupIds:
-          - !ImportValue 'eksctl-thoughtMachine-cluster-cluster::ClusterSecurityGroupId'
+          - !Ref ClusterSharedNodeSecurityGroup
         TagSpecifications:
           - ResourceType: instance
             Tags:
               - Key: Name
-                Value: thoughtMachine-cluster-linux-nodes-Node
+                Value: !Sub ${ClusterName}-linux-nodes-Node
               - Key: alpha.eksctl.io/nodegroup-name
                 Value: linux-nodes
               - Key: alpha.eksctl.io/nodegroup-type
@@ -273,7 +325,7 @@ Resources:
           - ResourceType: volume
             Tags:
               - Key: Name
-                Value: thoughtMachine-cluster-linux-nodes-Node
+                Value: !Sub ${ClusterName}-linux-nodes-Node
               - Key: alpha.eksctl.io/nodegroup-name
                 Value: linux-nodes
               - Key: alpha.eksctl.io/nodegroup-type
@@ -281,7 +333,7 @@ Resources:
           - ResourceType: network-interface
             Tags:
               - Key: Name
-                Value: thoughtMachine-cluster-linux-nodes-Node
+                Value: !Sub ${ClusterName}-linux-nodes-Node
               - Key: alpha.eksctl.io/nodegroup-name
                 Value: linux-nodes
               - Key: alpha.eksctl.io/nodegroup-type
@@ -290,13 +342,14 @@ Resources:
 
   ManagedNodeGroup:
     Type: 'AWS::EKS::Nodegroup'
+    DependsOn: ControlPlane
     Properties:
       AmiType: AL2_x86_64
-      ClusterName: thoughtMachine-cluster
+      ClusterName: !Ref ClusterName
       InstanceTypes:
         - t2.micro
       Labels:
-        alpha.eksctl.io/cluster-name: thoughtMachine-cluster
+        alpha.eksctl.io/cluster-name: !Ref ClusterName
         alpha.eksctl.io/nodegroup-name: linux-nodes
       LaunchTemplate:
         Id: !Ref LaunchTemplate
@@ -308,9 +361,9 @@ Resources:
         DesiredSize: 2
         MaxSize: 2
         MinSize: 2
-      Subnets: !Split 
-        - ','
-        - !ImportValue 'eksctl-thoughtMachine-cluster-cluster::SubnetsPublic'
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
       Tags:
         alpha.eksctl.io/nodegroup-name: linux-nodes
         alpha.eksctl.io/nodegroup-type: managed
@@ -359,8 +412,19 @@ Resources:
           Value: !Sub '${AWS::StackName}/ClusterSharedNodeSecurityGroup'
       VpcId: !Ref VPC
 
+  IngressSSHNodeGroupSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow SSH connection from anywhere
+      GroupId: !Ref ClusterSharedNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
   IngressDefaultClusterToNodeSG:
     Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: ControlPlane
     Properties:
       Description: >-
         Allow managed and unmanaged nodes to communicate with each other (all
@@ -385,6 +449,7 @@ Resources:
 
   IngressNodeToDefaultClusterSG:
     Type: 'AWS::EC2::SecurityGroupIngress'
+    DependsOn: ControlPlane
     Properties:
       Description: Allow unmanaged nodes to communicate with control plane (all ports)
       FromPort: 0
@@ -431,34 +496,103 @@ Resources:
       Roles:
         - !Ref ServiceRole
 
-    PolicyELBPermissions:
-    Type: 'AWS::IAM::Policy'
+  PolicyELBPermissions:
+      Type: 'AWS::IAM::Policy'
+      Properties:
+        PolicyDocument:
+          Statement:
+            - Action:
+                - 'ec2:DescribeAccountAttributes'
+                - 'ec2:DescribeAddresses'
+                - 'ec2:DescribeInternetGateways'
+              Effect: Allow
+              Resource: '*'
+          Version: 2012-10-17
+        PolicyName: !Sub '${AWS::StackName}-PolicyELBPermissions'
+        Roles:
+          - !Ref ServiceRole
+
+  MasterDB:
+    Type: AWS::RDS::DBInstance
     Properties:
-      PolicyDocument:
-        Statement:
-          - Action:
-              - 'ec2:DescribeAccountAttributes'
-              - 'ec2:DescribeAddresses'
-              - 'ec2:DescribeInternetGateways'
-            Effect: Allow
-            Resource: '*'
-        Version: 2012-10-17
-      PolicyName: !Sub '${AWS::StackName}-PolicyELBPermissions'
-      Roles:
-        - !Ref ServiceRole
+      DBName: !Ref 'DBName'
+      AllocatedStorage: !Ref 'DBAllocatedStorage'
+      DBInstanceClass: !Ref 'DBInstanceClass'
+      Engine: postgres
+      MasterUsername: !Ref 'DBUser'
+      MasterUserPassword: !Ref 'DBPassword'
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroupName
+      VPCSecurityGroups: 
+      - !GetAtt DatabaseSecurityGroup.GroupId
+      Tags:
+      - Key: Name
+        Value: Master Database
+    DeletionPolicy: Snapshot
+
+  DBSubnetGroupName:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: Two private subnets grouped for RDS
+      SubnetIds: 
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: Database Subnet Group
+      
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL instance
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/DBSecurityGroup'
+      VpcId: !Ref VPC
+
+  IngressDatabaseSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow ec2 to connect to RDS
+      FromPort: 5432
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      SourceSecurityGroupId: !Ref ClusterSharedNodeSecurityGroup
+      ToPort: 5432
+
+  IngressDatabaseSSHSG:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Allow SSH from anywhere
+      FromPort: 22
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+
+
 
 Outputs:
   VPC:
     Description: A reference to the created VPC
     Value: !Ref VPC
 
-  PublicSubnets:
-    Description: A list of the public subnets
-    Value: !Join [ ",", [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]]
+  SubnetsPrivate:
+    Value: !Join 
+      - ','
+      - - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPrivate'
 
-  PrivateSubnets:
-    Description: A list of the private subnets
-    Value: !Join [ ",", [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]]
+  SubnetsPublic:
+    Value: !Join 
+      - ','
+      - - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPublic'
 
   PublicSubnet1:
     Description: A reference to the public subnet in the 1st Availability Zone
@@ -480,3 +614,51 @@ Outputs:
     Description: Security group with no ingress rule
     Value: !Ref NoIngressSecurityGroup
 
+  ARN:
+    Value: !GetAtt 
+      - ControlPlane
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ARN'
+
+  CertificateAuthorityData:
+    Value: !GetAtt 
+      - ControlPlane
+      - CertificateAuthorityData
+
+  ClusterSecurityGroupId:
+    Value: !GetAtt 
+      - ControlPlane
+      - ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}::ClusterSecurityGroupId'
+
+  ClusterStackName:
+    Value: !Ref 'AWS::StackName'
+
+  Endpoint:
+    Value: !GetAtt 
+      - ControlPlane
+      - Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}::Endpoint'
+
+  FeatureNATMode:
+    Value: Single
+
+  SecurityGroup:
+    Value: !Ref ControlPlaneSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}::SecurityGroup'
+
+  ServiceRoleARN:
+    Value: !GetAtt 
+      - ServiceRole
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ServiceRoleARN'
+
+  SharedNodeSecurityGroup:
+    Value: !Ref ClusterSharedNodeSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}::SharedNodeSecurityGroup'
